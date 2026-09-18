@@ -44,7 +44,7 @@ Invoke-RestMethod -Uri http://localhost:8000/optimize-energy -Method Post -Conte
 
 | Var | Meaning |
 |---|---|
-| `GEMINI_API_KEY` | Google Gemini (recommended, free tier). Default model `gemini-flash-latest` |
+| `GEMINI_API_KEY` | Google Gemini (recommended, free tier). Default model `gemini-3.6-flash` |
 | `OPENAI_API_KEY` | OpenAI fallback (`gpt-4o-mini`) |
 | `GROQ_API_KEY` | Groq fallback (`llama-3.3-70b-versatile`) |
 | `LLM_MODEL` / `GEMINI_MODEL` / `OPENAI_MODEL` / `GROQ_MODEL` | Model override |
