@@ -22,7 +22,7 @@ to the optimizer.
 | Docker fallback (public) | `fahim3101/gridwise-llm:latest` |
 | Image digest (exact artifact) | `sha256:a82cc861ec64f8c3b0f1b35a1272d480aff2cc9ccf3cb0eb0e3f353f8a7e84a1` |
 | GitHub | `https://github.com/fahim3101/BUP-Hackathon-Preli` (public after deadline) |
-| Solution video (≤ 3 min) | *(link added here before final submission)* |
+| Solution video (≤ 3 min) | `https://drive.google.com/file/d/1XQ0leikAvxpDJJkT_5cacG11y8KuSPNq/view?usp=sharing` |
 
 ## 1. Quickstart — from a clean machine
 
@@ -31,7 +31,7 @@ git clone https://github.com/fahim3101/BUP-Hackathon-Preli.git
 cd BUP-Hackathon-Preli
 python -m pip install -r requirements.txt
 
-# optional: API keys for the LLM path (see section 4). Without keys the
+# optional: API keys for the LLM path (see section 3). Without keys the
 # service still works via the deterministic rule-parser fallback.
 # Windows:  copy .env.example .env
 # Linux:    cp .env.example .env
