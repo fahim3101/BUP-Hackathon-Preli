@@ -2,12 +2,19 @@
 import json
 import math
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .interpreter import interpret_notes
 from .optimizer import optimize
 
 app = FastAPI(title="GridWise LLM Energy Optimizer")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
