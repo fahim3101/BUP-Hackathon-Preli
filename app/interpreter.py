@@ -82,7 +82,7 @@ def _post_json(url, payload, headers, timeout=12, retries=1):
 
 def call_gemini(system, user_text, model, timeout=12):
     key = _env("GEMINI_API_KEY")
-    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or "gemini-flash-latest"
+    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or "gemini-3.6-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {"system_instruction": {"parts": [{"text": system}]},
                "contents": [{"parts": [{"text": user_text}]}],
