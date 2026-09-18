@@ -19,7 +19,7 @@ to the optimizer.
 | Item | Value |
 |---|---|
 | Live API | `https://gridwise-llm-a8o9.onrender.com` (`GET /health`, `POST /optimize-energy`) |
-| Docker fallback (public) | `fahim3101/gridwise-llm:latest` |
+| Docker fallback (public) | `fahim3101/gridwise-llm:latest` — Hub page: `https://hub.docker.com/r/fahim3101/gridwise-llm` |
 | Image digest (exact artifact) | `sha256:a82cc861ec64f8c3b0f1b35a1272d480aff2cc9ccf3cb0eb0e3f353f8a7e84a1` |
 | GitHub | `https://github.com/fahim3101/BUP-Hackathon-Preli` (public after deadline) |
 | Solution video (≤ 3 min) | `https://drive.google.com/file/d/1XQ0leikAvxpDJJkT_5cacG11y8KuSPNq/view?usp=sharing` |
@@ -227,7 +227,8 @@ Current status: **10/10 replay-valid, cost ratio 1.0000 vs reference.**
 
 ## 8. Docker fallback image
 
-Pull and run the exact submitted artifact:
+Pull and run the exact submitted artifact
+(Hub page: `https://hub.docker.com/r/fahim3101/gridwise-llm`):
 
 ```bash
 docker pull fahim3101/gridwise-llm:latest
