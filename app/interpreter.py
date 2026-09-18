@@ -65,12 +65,13 @@ def _post_json(url, payload, headers, timeout=12):
 
 def call_gemini(system, user_text, model, timeout=12):
     key = _env("GEMINI_API_KEY")
-    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or "gemini-2.0-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or "gemini-flash-latest"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {"system_instruction": {"parts": [{"text": system}]},
                "contents": [{"parts": [{"text": user_text}]}],
                "generationConfig": {"temperature": 0, "response_mime_type": "application/json"}}
-    out = _post_json(url, payload, {"Content-Type": "application/json"}, timeout)
+    out = _post_json(url, payload, {"Content-Type": "application/json",
+                                    "X-goog-api-key": key}, timeout)
     try:
         return out["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
