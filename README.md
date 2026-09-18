@@ -4,6 +4,13 @@ BUP CSE Fest 2026 Hackathon (Online Preliminary) — LLM-assisted operator direc
 
 Architecture: `Energy Data + Operator Notes → LLM Interpreter → Guardrail Validator → Math Optimizer → Final Validator → API Response`
 
+## 0. Submission (judge quick links)
+
+* Live API: `https://gridwise-llm-a8o9.onrender.com` — `GET /health`, `POST /optimize-energy`
+* Docker fallback (public, pullable): `fahim3101/gridwise-llm:latest`
+  * Digest: `sha256:a82cc861ec64f8c3b0f1b35a1272d480aff2cc9ccf3cb0eb0e3f353f8a7e84a1`
+* GitHub: `https://github.com/fahim3101/BUP-Hackathon-Preli` (public after deadline)
+
 ## 1. Quickstart (clean environment)
 
 ```bash
@@ -24,8 +31,18 @@ curl http://localhost:8000/health
 
 Optimize (SAMPLE-01 input in `BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json`):
 
+`sample01.json` is gitignored, generate it first (works on clean clone):
+
 ```bash
+python -c "import json; d=json.load(open('BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json')); json.dump(d['cases'][0]['input'], open('sample01.json','w'), indent=1)"
 curl -X POST http://localhost:8000/optimize-energy -H "Content-Type: application/json" -d @sample01.json
+```
+
+Live judge endpoint test (from outside your network):
+
+```bash
+curl https://gridwise-llm-a8o9.onrender.com/health
+curl -X POST https://gridwise-llm-a8o9.onrender.com/optimize-energy -H "Content-Type: application/json" -d @sample01.json
 ```
 
 With PowerShell:
@@ -86,9 +103,18 @@ python test_samples.py
 ## 7. Docker fallback image
 
 ```bash
+docker pull fahim3101/gridwise-llm:latest
+# digest-pinned (exact submitted artifact):
+# fahim3101/gridwise-llm@sha256:a82cc861ec64f8c3b0f1b35a1272d480aff2cc9ccf3cb0eb0e3f353f8a7e84a1
+docker run -p 8000:8000 -e GEMINI_API_KEY=... fahim3101/gridwise-llm:latest
+curl http://localhost:8000/health
+```
+
+Build from source (same Dockerfile judges use as fallback):
+
+```bash
 docker build -t gridwise-llm:latest .
 docker run -p 8000:8000 -e GEMINI_API_KEY=... gridwise-llm:latest
-curl http://localhost:8000/health
 ```
 
 Image exposes `8000`, binds `0.0.0.0`, contains no secrets. Publish with an exact tag/digest (Docker Hub/GHCR) for submission.
