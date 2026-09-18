@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 
 from .rule_parser import rule_parse_note, parse_time_window
@@ -56,11 +57,27 @@ def build_prompt(notes, capacity):
     return sys, json.dumps(user)
 
 
-def _post_json(url, payload, headers, timeout=12):
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _post_json(url, payload, headers, timeout=12, retries=1):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    base = {"Content-Type": "application/json", "User-Agent": BROWSER_UA, "Accept": "*/*"}
+    base.update(headers or {})
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=data, headers=base, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            last = e
+            if 500 <= e.code < 600 and attempt < retries:
+                time.sleep(1.5)
+                continue
+            raise
+    raise last
 
 
 def call_gemini(system, user_text, model, timeout=12):
