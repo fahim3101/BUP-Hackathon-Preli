@@ -59,7 +59,7 @@ def parse_windows(note: str):
             cands.append({"h": 12, "mer": "pm", "colon": False, "pos": m.start()})
             continue
         if tok == "midnight":
-            cands.append({"h": 0, "mer": "am", "colon": False, "pos": m.start()})
+            cands.append({"h": 0, "mer": "am", "colon": False, "mid": True, "pos": m.start()})
             continue
         raw_h, raw_min = int(tok), int(raw_min) if raw_min else 0
         if raw_min >= 60 or raw_h > 23:
@@ -68,6 +68,10 @@ def parse_windows(note: str):
         nxt = t[end:end + 8]
         if "%" in nxt[:4] or "kwh" in nxt[:6] or re.match(r"\s*kw\b", nxt) or "percent" in nxt[:10]:
             continue  # a quantity, not a time
+        if re.match(r"\s*-\s*(fifth|quarter|third|half|fourth)", t[end:end + 12], re.I):
+            continue  # "one-fifth" fraction, not a time
+        if re.match(r"\s+(quarters?|thirds?|fifths?|hal(f|ves)|fourths?)\b", t[end:end + 12], re.I):
+            continue  # "three quarters" fraction, not a time
         has_colon = ":" in m.group(0)
         if not mk and not has_colon:
             ctx = t[max(0, m.start() - 14): end + 14]
@@ -97,17 +101,20 @@ def parse_windows(note: str):
         a["mer"] = "pm"
     s = a["h"]
     e = b["h"]
-    # "11 AM until 1" / bare evening ranges
-    if e <= s and b["mer"] is None and not b["colon"]:
-        if e + 12 <= 24 and e + 12 > s and (b["h"] <= 12):
-            # same-day assumption first ("6-8 PM" handled by inheritance; "2 to 4" bare)
-            if "pm" in t or "evening" in t or "afternoon" in t or any(
-                    k in t for k in ["solar", "pv", "panel", "charger", "battery", "grid", "reserve"]):
-                e = e + 12
-    # solar/daytime bare numbers default to PM
-    if a["mer"] is None and not a["colon"] and 1 <= s <= 11 and any(
-            k in t for k in ["solar", "pv", "panel", "afternoon", "evening"]):
+    if b.get("mid"):
+        e = 24  # "... until midnight"
+    pm_ctx = ("pm" in t or "evening" in t or "afternoon" in t)
+    sol_ctx = any(k in t for k in ["solar", "pv", "panel", "rooftop", "inverter", "photovoltaic"])
+    # bare numbers in daytime/solar context are PM (decided BEFORE any wrap logic)
+    if a["mer"] is None and not a["colon"] and 1 <= s <= 11 and (sol_ctx or pm_ctx):
         s += 12
+        a["mer"] = "pm"
+    if b["mer"] is None and not b["colon"] and 1 <= e <= 11 and (sol_ctx or pm_ctx or a["mer"] == "pm"):
+        e += 12
+        b["mer"] = "pm"
+    # "11 AM until 1": bare end earlier than start -> assume crosses noon
+    if e <= s and b["mer"] is None and not b["colon"] and e + 12 <= 24 and e + 12 > s:
+        e += 12
     if not (0 <= s <= 23) or not (0 <= e <= 24):
         return []
     if e == s:
@@ -145,10 +152,12 @@ def extract_kwh(note: str):
 
 
 def _solar_unit(t: str) -> str:
-    # reduction phrasing -> percent_reduction, else what is LEFT -> percent_remaining
-    if re.search(r"reduc|decrease", t):
+    # "reduced by X" / "cutting ... by X" / "fall by X" / "X% reduction" = CUT.
+    # "drop to X" / "reduce to X" / "of forecast" = what is LEFT.
+    if re.search(r"\bby\b\s*(\d|three|quarter|half|third|fifth)", t) and re.search(
+            r"reduc|cut|drop|lower|decrease|fall|los|shav", t):
         return "percent_reduction"
-    if re.search(r"cut\w*\b.{0,20}\bby\b\s*\d|drop\s+by|lower\s+by", t):
+    if re.search(r"\breduction\b", t):
         return "percent_reduction"
     return "percent_remaining"
 
