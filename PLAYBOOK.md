@@ -64,3 +64,12 @@ Secret (key/token) kokhono chat-e, code-e ba git-e diba na."
   (`--llm` flag tests the live LLM path too).
 - Gemini strict `response_json_schema` + 8s timeout + browser UA + 5xx retry.
 - Verify anytime: `python test_samples.py` (10/10) + `python eval_paraphrases.py` (32/32).
+
+## 6. Multi-chat niyom (eker odhik chat use korle)
+
+- Single source of truth = git HEAD. Onno chat diye kaj korale age `git pull`,
+  pore `git log --oneline -5` + `git status` diye milaw — divergent change
+  thakle age merge, tarpor notun kaj.
+- Dashboard/Hub-er kaj (Render env, Docker push, cron) git-e dekha jay na —
+  ogulo baire theke verify koro: onno network theke `docker pull/run` + PUBLIC
+  URL-e full 10 sample. Localhost pass manei submit-ready NA.
