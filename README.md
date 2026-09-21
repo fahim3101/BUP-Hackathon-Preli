@@ -146,28 +146,28 @@ Totals are always recomputed from `hourly_plan`, which is the source of truth.)
 | `LLM_MODEL` / `GEMINI_MODEL` / `OPENAI_MODEL` / `GROQ_MODEL` | Model-name override (see `.env.example`) |
 | `LLM_DISABLED=1` | Force the offline rule-based path (local tests / CI) |
 
-* The prompt pins the model to the 6 allowed directive types, the whole-hour
-  convention (start-inclusive / end-exclusive, e.g. 1 PM–3 PM → `[13,14]`),
-  solar factor = **remaining** fraction (`80% reduction` → `0.2`), `% of
-  capacity → kWh` conversion, and `no_op` semantics for irrelevant notes.
-* Resilience: if no key is set, the LLM times out (>10 s), returns malformed
+* The prompt pins the model to the 6 allowed directive types — but the LLM
+  reports only **language judgments**: `windows [[start,end), ...]` plus
+  `value + value_unit` (`kwh` | `percent_remaining` | `percent_reduction` |
+  `none`). It never does arithmetic: `80% reduction` → `80 percent_reduction`,
+  `drop to 20%` → `20 percent_remaining`. All conversion (windows → hours
+  incl. midnight/overnight wrap, `%` → factor/kWh) happens in `app/units.py`.
+* Resilience: if no key is set, the LLM times out (>8 s), returns malformed
   JSON, or fails guardrails, **each note falls back individually** to the
-  deterministic rule parser (`app/rule_parser.py`). The service never crashes
-  and always answers within the 30 s judge limit (local p95 ≈ 0.07 s).
+  deterministic rule parser (`app/rule_parser.py`, same intermediate shape).
+  The service never crashes and always answers within the 30 s judge limit.
 
-## 4. Guardrails — deterministic (`app/interpreter.py`)
+## 4. Guardrails — deterministic (`app/interpreter.py` + `app/units.py`)
 
-Every LLM entry passes `guardrail_entry` before it can touch the optimizer:
-
-* `directive_type` must be one of the 6 supported values; `note_index` must
-  cover `0..N-1` exactly once, returned in order.
-* `no_op` ⇔ `applies=false` + `structured_adjustment=null`; every other
-  directive ⇔ `applies=true` + the exact required adjustment shape.
-* `hours`: unique integers `0..23`, ascending.
-* `solar_reduction.factor` ∈ [0,1]; `minimum_energy_kwh` ∈ [0, capacity];
-  `max_grid_kwh` ≥ 0 and finite.
-* Invalid LLM entries are discarded **per-note** and replaced by the rule
-  parser — one bad note can never poison the other notes.
+Every LLM entry is treated as untrusted until it passes structural checks
+(correct `note_index`, allowed `directive_type`, known `value_unit`, finite
+`value`, well-formed `windows`) and `app/units.py` converts it to the exact
+`structured_adjustment` (hours unique ascending `0..23`, factor ∈ [0,1],
+reserve ∈ [0, capacity], grid cap ≥ 0). Invalid entries are discarded
+**per-note** and replaced by the rule parser — one bad note can never poison
+the others. Every response is also replay-validated (`app/validator.py`)
+before it is returned; a failing plan falls back to a base-valid schedule
+instead of reaching the judge.
 
 ## 5. Optimizer / solver (`app/optimizer.py`)
 
@@ -224,6 +224,19 @@ python test_samples.py
 against the interpreted directives + battery / energy-balance / neutrality
 rules, and compares interpretation semantics (hours + numeric values).
 Current status: **10/10 replay-valid, cost ratio 1.0000 vs reference.**
+
+## 7b. Paraphrase robustness test (hidden-style wording)
+
+```bash
+python eval_paraphrases.py
+# expected: RULE: 32/32
+python eval_paraphrases.py --llm   # needs API key; expected: LLM: 32/32
+```
+
+`tests/paraphrases.json` holds 32 self-written notes with ground truth —
+overnight wraps, midnight ends, single hours, halve/nothing/cushion/supply
+synonyms, reduction-vs-remaining traps, and distractors with times. The rule
+parser alone scores 32/32, so the safety net holds even in a total LLM outage.
 
 ## 8. Docker fallback image
 
