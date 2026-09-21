@@ -34,7 +34,11 @@ LLM diye operator note pore, guardrail diye check kore, LP (scipy/HiGHS) diye
 - [ ] Nijer lekha 30+ paraphrase set-e fallback 100% (overnight, midnight-end,
       single-hour, halve/nothing/cushion/supply/storage sob cover)
 - [ ] Prompt: LLM sudhu windows+unit dey, arithmetic code-e; strict JSON schema
-- [ ] Kompokkhe 2 provider-er key hate (primary + backup), burst test 20+ req 0 fail
+- [ ] 2 provider x 2-3 model (primary fast + strict-schema, backup onno company,
+      optional choto 3rd). 4/5-ta lagbe na — 2-tar por benefit kome, code jotil
+      hoy. Protita model-ke paraphrase set-e alada pass korate hobe; 429-e
+      per-model cooldown + total time budget rakho. Model naam event day-te
+      verify koro (naam 6 mase bodlay — amader 2.0-flash → 3.6-flash hoisilo).
 - [ ] p95 latency mapo (<5s target); per-request LLM time log koro
 - [ ] Service-e self-check replay (invalid response baire jabe na)
 - [ ] PUBLIC URL-er biruddhe full 10 sample pass (localhost-e na)
