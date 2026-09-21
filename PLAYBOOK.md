@@ -17,8 +17,9 @@ LLM diye operator note pore, guardrail diye check kore, LP (scipy/HiGHS) diye
    `produce nothing` (=0), single-hour window, `storage` (=battery),
    `until midnight` end, overnight wrap (`10 PM to 1 AM`), `cushion` (=reserve),
    `supply/deliver power` (=discharge). Public-e 10/10 manei ready NA.
-2. Single LLM provider (Gemini). Judge burst-e 429/503 khele fallback-e pori,
-   jekhane accuracy 65%. Oder 5 model x 2 provider + cooldown.
+2. Single LLM provider (Gemini) chilo tokhon. Judge burst-e 429/503 khele
+   fallback-e portam, jekhane accuracy chilo 65% (ekhon §5-er fix-er por 31/31).
+   Oder chilo 5 model x 2 provider + cooldown — porer bar 2 provider mandatory.
 3. Prompt contract durbol: LLM-er kache final hours+factor chawa hoise.
    Thik design: LLM dibe `windows [start,end)` + `value+unit`
    (remaining vs reduction), guner hisab CODE korbe.
@@ -40,7 +41,7 @@ LLM diye operator note pore, guardrail diye check kore, LP (scipy/HiGHS) diye
 - [ ] Docker image push + digest README-te + `docker pull/run` verify
 - [ ] Cron warm-ping + judging night-e paid tier bibechona
 - [ ] Repo public timing, video link (logout-e khule?), secret leak check
-      (`git log -p | grep -i key` khali thakte hobe)
+      (PowerShell: `git log -p | Select-String "API_KEY|api_key|AIza|AQ\."` khali thakte hobe)
 - [ ] Judge test korlo kina Render log-e `POST` search diye confirm
 
 ## 4. Notun chat-ke dewar starter prompt (copy-paste)
