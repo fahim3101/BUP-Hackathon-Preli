@@ -2,9 +2,9 @@
 
 Flow: operator notes -> LLM (Gemini / OpenAI / Groq) -> guardrail validator
       -> per-note fallback to rule_parser on any failure.
-The LLM is always attempted first when credentials exist; otherwise the
-rule parser provides a fully offline, deterministic result so local
-reproduction and judging never crash.
+The LLM emits ONLY language judgments — directive type, windows [start,end)
+and value+unit. ALL arithmetic (windows -> hours, % -> factor/kWh) happens in
+app/units.py, so LLM arithmetic mistakes cannot leak through.
 """
 import json
 import os
@@ -13,10 +13,13 @@ import time
 import urllib.error
 import urllib.request
 
-from .rule_parser import rule_parse_note, parse_time_window
+from .rule_parser import rule_parse_note
+from .units import ADJ_KEYS, to_adjustment
 
 ALLOWED = {"solar_reduction", "minimum_battery_reserve", "no_charge_window",
            "no_discharge_window", "max_grid_window", "no_op"}
+UNIT_ENUM = ("kwh", "percent_remaining", "percent_reduction", "none")
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 _cache: dict = {}
 
@@ -33,35 +36,58 @@ def llm_enabled() -> bool:
 
 def build_prompt(notes, capacity):
     sys = (
-        "You are GridWise, a smart-campus energy operator-note interpreter.\n"
-        "Convert EACH operator note into exactly ONE structured directive.\n"
-        "Supported directive_type values (only these):\n"
-        '- solar_reduction: usable solar fraction remains. structured_adjustment={"hours":[...], "factor":0..1}\n'
-        '- minimum_battery_reserve: battery energy floor. {"hours":[...], "minimum_energy_kwh":number}\n'
-        '- no_charge_window: charging forbidden. {"hours":[...]}\n'
-        '- no_discharge_window: discharging forbidden. {"hours":[...]}\n'
-        '- max_grid_window: grid import cap per hour. {"hours":[...], "max_grid_kwh":number}\n'
-        '- no_op: note irrelevant to this 24h energy schedule. structured_adjustment=null\n'
-        "Rules:\n"
-        "- hours are whole hours 0-23, start-INCLUSIVE end-EXCLUSIVE, ascending unique. "
-        "1 PM to 3 PM -> [13,14]. noon=12, midnight=0. 13:00-15:00 -> [13,14].\n"
-        "- solar factor = usable fraction REMAINING (0-1). '80% reduction' -> 0.2. 'drop to 20%' -> 0.2. '25% of forecast' -> 0.25. 'about half' -> 0.5. 'one-fifth' -> 0.2.\n"
-        f"- battery capacity is {capacity} kWh. Convert percentages: '50% of capacity' -> {0.5 * float(capacity)}.\n"
-        "- cafeteria/menu/sports/registration/library/seminar/club notices with no energy content -> no_op.\n"
-        "- Return ONLY a JSON array with one object per note in order: "
-        '[{"note_index":0,"applies":true,"directive_type":"...","structured_adjustment":{...}|null,"explanation":"..."}]. '
-        "applies=false only for no_op."
+        "You convert campus energy operator notes into structured directives for ONE 24-hour schedule.\n"
+        "Return EXACTLY one item per note, in order, note_index starting at 0.\n"
+        "directive_type (only these): solar_reduction | minimum_battery_reserve | "
+        "no_charge_window | no_discharge_window | max_grid_window | no_op.\n"
+        "Meaning: solar_reduction = rooftop solar/PV output lowered; "
+        "minimum_battery_reserve = battery must keep stored energy; "
+        "no_charge_window = battery cannot be charged; "
+        "no_discharge_window = battery cannot discharge; "
+        "max_grid_window = grid import per hour capped; "
+        "no_op = admin news/events/menus/deadlines, unrelated equipment, or another period (next week/month).\n"
+        "windows: list of [start_hour, end_hour) on a 24h clock, start included, end EXCLUDED. "
+        '"1 PM to 3 PM" -> [[13,15]]. noon=12. Midnight ending a window -> 24. '
+        '"from 6 PM for three hours" -> [[18,21]]. Single hour "at 7 PM" -> [[19,20]]. '
+        '"all day" -> [[0,24]]. Overnight "10 PM to 2 AM" -> [[22,2]]. no_op -> [].\n'
+        "value + value_unit (NEVER do arithmetic, just report what the note says):\n"
+        "- kwh: absolute energy (reserve kWh, grid cap kWh per hour).\n"
+        '- percent_remaining: what is LEFT ("drops to 20%" -> 20, "a quarter of forecast" -> 25, '
+        '"half" -> 50, "one-fifth" -> 20). Reserve as % of battery capacity also uses this.\n'
+        '- percent_reduction: what is CUT ("80% reduction" -> 80, "reduced by three quarters" -> 75).\n'
+        "- none (value 0): charge/discharge windows and no_op.\n"
+        "Never invent numbers; use only stated or clearly implied quantities.\n"
+        f"Battery capacity is {capacity} kWh (for context only; report percentages as percentages).\n"
+        "Return ONLY a JSON array: "
+        '[{"note_index":0,"directive_type":"...","windows":[[s,e]],"value":number,'
+        '"value_unit":"kwh|percent_remaining|percent_reduction|none","explanation":"..."}].'
     )
     user = {"battery_capacity_kwh": capacity,
             "notes": [{"note_index": i, "text": n} for i, n in enumerate(notes)]}
     return sys, json.dumps(user)
 
 
+GEMINI_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "note_index": {"type": "integer"},
+            "directive_type": {"type": "string", "enum": sorted(ALLOWED)},
+            "windows": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
+            "value": {"type": "number"},
+            "value_unit": {"type": "string", "enum": list(UNIT_ENUM)},
+            "explanation": {"type": "string"},
+        },
+        "required": ["note_index", "directive_type", "windows", "value", "value_unit", "explanation"],
+    },
+}
+
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
-def _post_json(url, payload, headers, timeout=12, retries=1):
+def _post_json(url, payload, headers, timeout=8, retries=1):
     data = json.dumps(payload).encode()
     base = {"Content-Type": "application/json", "User-Agent": BROWSER_UA, "Accept": "*/*"}
     base.update(headers or {})
@@ -80,13 +106,14 @@ def _post_json(url, payload, headers, timeout=12, retries=1):
     raise last
 
 
-def call_gemini(system, user_text, model, timeout=12):
+def call_gemini(system, user_text, model, timeout=8):
     key = _env("GEMINI_API_KEY")
-    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or "gemini-3.6-flash"
+    model = model or _env("LLM_MODEL") or _env("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {"system_instruction": {"parts": [{"text": system}]},
                "contents": [{"parts": [{"text": user_text}]}],
-               "generationConfig": {"temperature": 0, "response_mime_type": "application/json"}}
+               "generationConfig": {"temperature": 0, "response_mime_type": "application/json",
+                                    "response_json_schema": GEMINI_SCHEMA}}
     out = _post_json(url, payload, {"Content-Type": "application/json",
                                     "X-goog-api-key": key}, timeout)
     try:
@@ -95,7 +122,7 @@ def call_gemini(system, user_text, model, timeout=12):
         return json.dumps(out)
 
 
-def call_openai_compatible(system, user_text, base_url, api_key, model, timeout=12):
+def call_openai_compatible(system, user_text, base_url, api_key, model, timeout=8):
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {"model": model, "temperature": 0,
                "messages": [{"role": "system", "content": system},
@@ -106,11 +133,11 @@ def call_openai_compatible(system, user_text, base_url, api_key, model, timeout=
     return out["choices"][0]["message"]["content"]
 
 
-def call_llm(system, user_text, timeout=10):
+def call_llm(system, user_text, timeout=8):
     """Try providers in order: Gemini -> OpenAI -> Groq."""
     if _env("GEMINI_API_KEY"):
         try:
-            return call_gemini(system, user_text, _env("GEMINI_MODEL") or _env("LLM_MODEL") or "gemini-2.0-flash", timeout)
+            return call_gemini(system, user_text, _env("GEMINI_MODEL") or _env("LLM_MODEL") or DEFAULT_GEMINI_MODEL, timeout)
         except Exception:
             pass
     if _env("OPENAI_API_KEY"):
@@ -134,7 +161,6 @@ def extract_json_array(text):
     t = text.strip()
     t = re.sub(r"^```(?:json)?", "", t).strip()
     t = re.sub(r"```$", "", t).strip()
-    # direct parse
     try:
         obj = json.loads(t)
         if isinstance(obj, list):
@@ -152,69 +178,37 @@ def extract_json_array(text):
     raise ValueError("no JSON array in LLM output")
 
 
-def guardrail_entry(e, n_notes, capacity):
-    """Validate+normalise one LLM entry. Returns normalised dict or raises."""
-    if not isinstance(e, dict):
+def _check_intermediate(item) -> None:
+    """Structural check of one raw LLM item (untrusted). Raises on failure."""
+    if not isinstance(item, dict):
         raise ValueError("entry not object")
-    ni = e.get("note_index")
-    if not isinstance(ni, int) or not (0 <= ni < n_notes):
-        raise ValueError("bad note_index")
-    dt = e.get("directive_type")
-    if dt not in ALLOWED:
+    if item.get("directive_type") not in ALLOWED:
         raise ValueError("bad directive_type")
-    applies = e.get("applies")
-    adj = e.get("structured_adjustment")
-    exp = str(e.get("explanation", "") or "")[:300] or "Interpreted operator note."
-    if dt == "no_op":
-        if applies is not False:
-            raise ValueError("no_op must have applies=false")
-        if adj is not None:
-            raise ValueError("no_op adjustment must be null")
-        return {"note_index": ni, "applies": False, "directive_type": "no_op",
+    if item.get("value_unit") not in UNIT_ENUM:
+        raise ValueError("bad value_unit")
+    v = item.get("value")
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise ValueError("bad value")
+    if not isinstance(item.get("windows"), list):
+        raise ValueError("bad windows")
+
+
+def to_entry(note_index, dtype, inter, capacity, explanation) -> dict:
+    """Convert a checked intermediate item to the exact response entry."""
+    exp = (str(explanation or "").strip()[:300]
+           or "Interpreted operator note.")
+    if dtype == "no_op":
+        return {"note_index": note_index, "applies": False, "directive_type": "no_op",
                 "structured_adjustment": None, "explanation": exp}
-    if applies is not True:
-        raise ValueError("applicable directive must have applies=true")
-    if not isinstance(adj, dict):
-        raise ValueError("adjustment must be object")
-    hours = adj.get("hours")
-    if not isinstance(hours, list) or not hours:
-        raise ValueError("hours missing")
-    if any(not isinstance(h, int) or not (0 <= h <= 23) for h in hours):
-        raise ValueError("hour out of range")
-    if len(set(hours)) != len(hours):
-        raise ValueError("duplicate hours")
-    hours = sorted(set(hours))
-    if dt == "solar_reduction":
-        f = adj.get("factor")
-        if not isinstance(f, (int, float)) or not (0 <= f <= 1):
-            raise ValueError("bad factor")
-        if set(adj.keys()) - {"hours", "factor"}:
-            pass
-        return {"note_index": ni, "applies": True, "directive_type": dt,
-                "structured_adjustment": {"hours": hours, "factor": float(f)},
-                "explanation": exp}
-    if dt == "minimum_battery_reserve":
-        v = adj.get("minimum_energy_kwh")
-        if not isinstance(v, (int, float)) or not (0 <= v <= capacity):
-            raise ValueError("bad reserve")
-        return {"note_index": ni, "applies": True, "directive_type": dt,
-                "structured_adjustment": {"hours": hours, "minimum_energy_kwh": float(v)},
-                "explanation": exp}
-    if dt in ("no_charge_window", "no_discharge_window"):
-        return {"note_index": ni, "applies": True, "directive_type": dt,
-                "structured_adjustment": {"hours": hours}, "explanation": exp}
-    if dt == "max_grid_window":
-        v = adj.get("max_grid_kwh")
-        if not isinstance(v, (int, float)) or v < 0:
-            raise ValueError("bad grid cap")
-        return {"note_index": ni, "applies": True, "directive_type": dt,
-                "structured_adjustment": {"hours": hours, "max_grid_kwh": float(v)},
-                "explanation": exp}
-    raise ValueError("unknown directive")
+    adj = to_adjustment(dtype, inter, float(capacity))  # raises on any violation
+    if set(adj) != ADJ_KEYS[dtype]:
+        raise ValueError("bad adjustment shape")
+    return {"note_index": note_index, "applies": True, "directive_type": dtype,
+            "structured_adjustment": adj, "explanation": exp}
 
 
 def rule_fallback_entry(idx, note, capacity):
-    dt, adj = rule_parse_note(note, capacity)
+    dt, inter = rule_parse_note(note)
     if dt == "no_op":
         return {"note_index": idx, "applies": False, "directive_type": "no_op",
                 "structured_adjustment": None,
@@ -226,14 +220,17 @@ def rule_fallback_entry(idx, note, capacity):
         "no_discharge_window": "Battery discharging is unavailable during the stated window.",
         "max_grid_window": "Grid import is capped during the stated window.",
     }
-    return {"note_index": idx, "applies": True, "directive_type": dt,
-            "structured_adjustment": adj, "explanation": exp_map.get(dt, "Applied operator directive.")}
+    try:
+        return to_entry(idx, dt, inter, float(capacity), exp_map.get(dt, "Applied operator directive."))
+    except Exception:
+        return {"note_index": idx, "applies": False, "directive_type": "no_op",
+                "structured_adjustment": None,
+                "explanation": "This note does not affect the 24-hour energy schedule."}
 
 
 def interpret_notes(notes, capacity):
     """Main entry: LLM first (if configured), guardrails, per-note rule fallback."""
     n = len(notes)
-    # cache key includes capacity bucket to handle % conversions
     key = (tuple(notes), round(float(capacity), 3))
     if key in _cache:
         return [dict(e) for e in _cache[key]]
@@ -242,8 +239,7 @@ def interpret_notes(notes, capacity):
     if llm_enabled():
         try:
             system, user_text = build_prompt(notes, capacity)
-            t0 = time.time()
-            raw = call_llm(system, user_text, timeout=10)
+            raw = call_llm(system, user_text, timeout=8)
             arr = extract_json_array(raw)
             if isinstance(arr, list) and len(arr) == n:
                 llm_entries = arr
@@ -256,22 +252,16 @@ def interpret_notes(notes, capacity):
         if llm_entries is not None:
             try:
                 cand = next(x for x in llm_entries if isinstance(x, dict) and x.get("note_index") == i)
-                e = guardrail_entry(cand, n, float(capacity))
+                _check_intermediate(cand)
+                e = to_entry(i, cand["directive_type"], cand, float(capacity),
+                             cand.get("explanation"))
             except Exception:
                 e = None
         if e is None:
             e = rule_fallback_entry(i, note, float(capacity))
-            # final safety: validate fallback too
-            try:
-                e = guardrail_entry(e, n, float(capacity))
-            except Exception:
-                e = {"note_index": i, "applies": False, "directive_type": "no_op",
-                     "structured_adjustment": None,
-                     "explanation": "This note does not affect the 24-hour energy schedule."}
         out.append(e)
     out = sorted(out, key=lambda x: x["note_index"])
     _cache[key] = [dict(e) for e in out]
-    # bound cache
     if len(_cache) > 2000:
         _cache.clear()
     return out
