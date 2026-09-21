@@ -1,8 +1,8 @@
-"""Deterministic rule-based operator-note parser.
+"""Deterministic rule-based operator-note parser (fallback layer).
 
-Used as (a) fallback when the LLM is unavailable/slow/invalid and
-(b) repair/validation helper. Robust to paraphrases via keyword sets,
-whole-hour time normalisation and careful numeric extraction.
+Emits an INTERMEDIATE shape — directive type + windows [[start,end)] +
+value + value_unit — so all arithmetic (window -> hours, % -> factor/kWh)
+happens centrally in app/units.py, never here and never in the LLM.
 """
 import re
 
@@ -16,214 +16,193 @@ WORD_NUM = {
 
 ENERGY_KEYWORDS = [
     "solar", "pv", "photovoltaic", "panel", "rooftop", "sun",
-    "battery", "charg", "discharg", "grid", "feeder", "transformer",
-    "substation", "reserve", "import", "intake", "kwh", "kw",
-    "tariff", "inverter", "emergency", "backup",
+    "battery", "batteries", "stor", "charg", "discharg", "grid",
+    "feeder", "transformer", "substation", "reserve", "import",
+    "intake", "kwh", "kw", "tariff", "inverter", "emergency",
+    "backup", "cushion", "buffer",
 ]
+
+UNITS = ("kwh", "percent_remaining", "percent_reduction", "none")
 
 
 def _replace_word_numbers(text: str) -> str:
     out = text
-    # longest first to avoid partial overlap
     for w in sorted(WORD_NUM, key=len, reverse=True):
         out = re.sub(rf"\b{w}\b", str(WORD_NUM[w]), out, flags=re.IGNORECASE)
     return out
 
 
-def parse_time_window(note: str):
-    """Return sorted unique whole hours [start, end) or None."""
-    t = note.lower()
-    t = t.replace("–", "-").replace("—", "-")
-    t = re.sub(r"\bnoon\b", "12 pm", t)
-    t = re.sub(r"\bmidday\b", "12 pm", t)
-    t = re.sub(r"\bmidnight\b", "12 am", t)
-    t = _replace_word_numbers(t)
+def _tok_to_24h(raw_h: int, raw_min: int, marker: str, has_colon: bool):
+    if marker == "am":
+        return (0 if raw_h == 12 else raw_h), "am"
+    if marker == "pm":
+        return (12 if raw_h == 12 else (raw_h + 12 if raw_h < 12 else raw_h)), "pm"
+    if has_colon:
+        return raw_h, "24h"
+    return raw_h, None
 
-    # find numeric candidates; skip quantities (% / kwh / kw / bdt)
-    pat = re.compile(r"(\d{1,2})(?::(\d{1,2}))?\s*(am|pm|a\.m\.|p\.m\.)?")
-    cands = []  # (hour24_or_None, has_marker, raw_h, raw_min, marker, pos)
+
+def parse_windows(note: str):
+    """Return [[start,end), ...] with end possibly 24 (midnight) and
+    start > end meaning overnight wrap. Single-hour notes give [[h,h+1]]."""
+    t = note.lower().replace("–", "-").replace("—", "-")
+    t = re.sub(r"\bmidday\b", "noon", t)
+    t = _replace_word_numbers(t)
+    # midnight as a RANGE END means 24; as a start means 0
+    t = re.sub(r"\bmidnight\b", "12 am", t)
+
+    pat = re.compile(r"(noon|midnight|\d{1,2})(?::(\d{1,2}))?\s*(am|pm|a\.m\.|p\.m\.)?")
+    cands = []
     for m in pat.finditer(t):
-        raw_h = int(m.group(1))
-        raw_min = int(m.group(2)) if m.group(2) else 0
-        marker = (m.group(3) or "").replace(".", "")
+        tok, raw_min, mk = m.group(1), m.group(2), (m.group(3) or "").replace(".", "")
+        if tok == "noon":
+            cands.append({"h": 12, "mer": "pm", "colon": False, "pos": m.start()})
+            continue
+        if tok == "midnight":
+            cands.append({"h": 0, "mer": "am", "colon": False, "pos": m.start()})
+            continue
+        raw_h, raw_min = int(tok), int(raw_min) if raw_min else 0
+        if raw_min >= 60 or raw_h > 23:
+            continue
         end = m.end()
         nxt = t[end:end + 8]
-        if "%" in nxt[:4] or "kwh" in nxt[:6] or re.match(r"\s*kw\b", nxt):
-            continue
-        if "percent" in nxt[:10]:
-            continue
-        # minutes must be < 60; hours sanity
-        if raw_min >= 60:
-            continue
-        if not marker and ":" not in m.group(0):
-            # bare number: keep only if near time context
-            window = 14
-            ctx = t[max(0, m.start() - window): end + window]
-            if not re.search(r"from|between|until|till|\bto\b|through|and|-|hour|morning|afternoon|evening|night|am|pm", ctx):
+        if "%" in nxt[:4] or "kwh" in nxt[:6] or re.match(r"\s*kw\b", nxt) or "percent" in nxt[:10]:
+            continue  # a quantity, not a time
+        has_colon = ":" in m.group(0)
+        if not mk and not has_colon:
+            ctx = t[max(0, m.start() - 14): end + 14]
+            if not re.search(r"from|between|until|till|\bto\b|through|and|-|hour|morning|afternoon|evening|night|am|pm|noon|midnight", ctx):
                 continue
-            if raw_h > 23:
-                continue
-        else:
-            if raw_h > 23:
-                continue
-        cands.append({"raw_h": raw_h, "raw_min": raw_min, "marker": marker,
-                      "has_colon": ":" in m.group(0), "pos": m.start()})
-    if len(cands) < 2:
-        return None
-    # take first two candidates in textual order
-    cands = sorted(cands, key=lambda c: c["pos"])[:2]
+        h24, mer = _tok_to_24h(raw_h, raw_min, mk, has_colon)
+        cands.append({"h": h24, "mer": mer, "colon": has_colon, "pos": m.start()})
+
+    if not cands:
+        return []
+    cands = sorted(cands, key=lambda c: c["pos"])
+
+    # single-hour phrasing: "the 3 PM hour", "at 7 PM", "during the 7 AM hour"
+    if len(cands) == 1:
+        c = cands[0]
+        if re.search(r"\bhour\b|\bat\b", t):
+            h = c["h"]
+            if c["mer"] is None and h < 7 and ("evening" in t or "afternoon" in t or "night" in t):
+                h += 12
+            return [[h % 24, (h % 24) + 1]]
+        return []
+
     a, b = cands[0], cands[1]
-
-    # propagate am/pm when one side misses it ("1-3 pm")
-    if not a["marker"] and b["marker"] and not a["has_colon"] and a["raw_h"] <= 12:
-        a["marker"] = b["marker"]
-    if not b["marker"] and a["marker"] and not b["has_colon"] and b["raw_h"] <= 12:
-        # "11 am until 1" -> likely pm for the second if it would otherwise go backwards
-        pass  # handled by end<=start fix below
-
-    def to24(c, default_pm_context=False):
-        h, marker, has_colon = c["raw_h"], c["marker"], c["has_colon"]
-        if marker == "am":
-            return 0 if h == 12 else h
-        if marker == "pm":
-            return 12 if h == 12 else (h + 12 if h < 12 else h)
-        if has_colon:
-            return h  # 24h clock
-        # bare number
-        if default_pm_context and 1 <= h <= 11:
-            return h + 12
-        return h
-
-    solar_ctx = any(k in t for k in ["solar", "pv", "panel", "rooftop", "inverter", "photovoltaic"])
-    pm_hint = any(k in t for k in ["afternoon", "evening", "pm", "p.m."])
-    am_hint = "morning" in t
-    bare_pm = solar_ctx or pm_hint
-    if am_hint and not pm_hint:
-        bare_pm = False
-    s = to24(a, default_pm_context=bare_pm)
-    e = to24(b, default_pm_context=True if (bare_pm or b["raw_h"] <= 12 and s >= 11) else bare_pm)
-    # fix "11 am until 1" style
-    if e <= s and not b["marker"] and b["raw_h"] <= 12 and e + 12 <= 24 and e + 12 > s:
-        e = e + 12
-    if e <= s or s < 0 or e > 24 or s > 23:
-        return None
-    s = max(0, min(23, s))
-    e = max(1, min(24, e))
-    hours = list(range(s, e))
-    hours = sorted(set(h for h in hours if 0 <= h <= 23))
-    return hours or None
+    # "1-3 PM": first inherits PM
+    if a["mer"] is None and b["mer"] == "pm" and not a["colon"] and a["h"] <= 12:
+        a["h"] = 12 if a["h"] == 12 else a["h"] + 12
+        a["mer"] = "pm"
+    s = a["h"]
+    e = b["h"]
+    # "11 AM until 1" / bare evening ranges
+    if e <= s and b["mer"] is None and not b["colon"]:
+        if e + 12 <= 24 and e + 12 > s and (b["h"] <= 12):
+            # same-day assumption first ("6-8 PM" handled by inheritance; "2 to 4" bare)
+            if "pm" in t or "evening" in t or "afternoon" in t or any(
+                    k in t for k in ["solar", "pv", "panel", "charger", "battery", "grid", "reserve"]):
+                e = e + 12
+    # solar/daytime bare numbers default to PM
+    if a["mer"] is None and not a["colon"] and 1 <= s <= 11 and any(
+            k in t for k in ["solar", "pv", "panel", "afternoon", "evening"]):
+        s += 12
+    if not (0 <= s <= 23) or not (0 <= e <= 24):
+        return []
+    if e == s:
+        return [[s, s + 1]] if s < 23 else [[23, 24]]
+    return [[s, e]]  # e <= s intentionally kept: overnight wrap, expanded later
 
 
-def extract_solar_factor(note: str):
+def extract_percent(note: str):
+    """Return raw percentage number (0-100 scale) or None. Handles digits,
+    'percent', halve/halves, nothing/zero, quarter/third/fifth words."""
     t = note.lower()
     m = re.search(r"(\d+(?:\.\d+)?)\s*(%|percent)", t)
     if m:
-        p = float(m.group(1)) / 100.0
-        # "80% reduction" / "reduced by" / "cut by" => remaining = 1-p
-        if re.search(r"reduc|cut\s+by|drop\s+by|reduced\s+by|decrease", t):
-            return max(0.0, min(1.0, 1.0 - p))
-        return max(0.0, min(1.0, p))
-    # word fractions
-    if re.search(r"one[\s-]*fifth|1[\s-]*fifth|\bfifth\b", t):
-        return 0.2
-    if re.search(r"one[\s-]*quarter|1[\s-]*quarter|\bquarter\b", t):
-        return 0.25
-    if re.search(r"one[\s-]*third|1[\s-]*third|\bthird\b", t):
-        return 1.0 / 3.0
-    if re.search(r"one[\s-]*half|1[\s-]*half|\bhalf\b", t):
-        return 0.5
-    if re.search(r"\bthree[\s-]*quarter|3/4", t):
-        return 0.75
+        return float(m.group(1))
+    if re.search(r"\bhalv(e|es|ed|ing)\b|\bhalf\b", t):
+        return 50.0
+    if re.search(r"\bnothing\b|\bno\b.{0,12}\boutput\b|\bzero\b", t):
+        return 0.0
+    if re.search(r"one[\s-]*(fifth|quarter|third)|a[\s-]*(fifth|quarter|third)|\b(fifth|quarter|third)\b", t):
+        if "fifth" in t:
+            return 20.0
+        if "quarter" in t:
+            return 25.0
+        return 100.0 / 3.0
+    if re.search(r"three[\s-]*quarters?", t):
+        return 75.0
+    if re.search(r"two[\s-]*thirds?", t):
+        return 200.0 / 3.0
     return None
 
 
 def extract_kwh(note: str):
     m = re.search(r"(\d+(?:\.\d+)?)\s*kwh", note.lower())
-    if m:
-        return float(m.group(1))
-    return None
+    return float(m.group(1)) if m else None
 
 
-def extract_reserve_kwh(note: str, capacity: float):
-    t = note.lower()
-    kw = extract_kwh(note)
-    if kw is not None:
-        return kw
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(%|percent)", t)
-    if m and ("capacity" in t or "battery" in t):
-        return float(m.group(1)) / 100.0 * capacity
-    if "half" in t and ("capacity" in t or "battery" in t):
-        return 0.5 * capacity
-    if "quarter" in t and ("capacity" in t or "battery" in t):
-        return 0.25 * capacity
-    if "third" in t and ("capacity" in t or "battery" in t):
-        return capacity / 3.0
-    if "full" in t and "capacity" in t:
-        return float(capacity)
-    return None
+def _solar_unit(t: str) -> str:
+    # reduction phrasing -> percent_reduction, else what is LEFT -> percent_remaining
+    if re.search(r"reduc|decrease", t):
+        return "percent_reduction"
+    if re.search(r"cut\w*\b.{0,20}\bby\b\s*\d|drop\s+by|lower\s+by", t):
+        return "percent_reduction"
+    return "percent_remaining"
 
 
 def is_distractor(note: str) -> bool:
-    t = note.lower()
-    return not any(k in t for k in ENERGY_KEYWORDS)
+    return not any(k in note.lower() for k in ENERGY_KEYWORDS)
 
 
-def rule_parse_note(note: str, capacity: float):
-    """Return (directive_type, structured_adjustment). Never raises."""
+def rule_parse_note(note: str):
+    """Return (directive_type, intermediate|None). Intermediate shape:
+    {"windows": [[s,e],...], "value": number, "value_unit": unit}.
+    Never raises; no capacity needed (conversion is centralized)."""
     t = note.lower()
-    hours = parse_time_window(note)
+    windows = parse_windows(note)
 
     has_solar = any(k in t for k in ["solar", "pv", "photovoltaic", "panel", "rooftop", "inverter"])
-    has_battery = "battery" in t or "charg" in t or "discharg" in t
-    has_grid = any(k in t for k in ["grid", "feeder", "transformer", "substation", "import", "intake"])
-    neg = any(k in t for k in ["not ", "n't", "no ", "never", "disabled", "unavailable",
-                               "isolated", "must not", "cannot", "can't", "prohibit",
-                               "outage", "maintenance", "isolated", "inspect"])
-    has_discharge_word = "discharg" in t
-    has_charge_word = "charg" in t
-
+    has_grid = any(k in t for k in ["grid", "feeder", "transformer", "substation", "import",
+                                    "intake", "purchase", "utility", "demand response"])
     # --- max_grid_window ---
-    if has_grid and re.search(r"not exceed|must stay|stay at|or below|at or below|capped|cap\b|limit|maximum|at most|no more than", t):
-        cap = extract_kwh(note)
-        if cap is not None and hours:
-            return "max_grid_window", {"hours": hours, "max_grid_kwh": cap}
+    if has_grid and re.search(r"not exceed|must stay|stay at|or below|at or below|capp?ed|\bcap\b|limit|maximum|at most|no more than|keep.{0,20}(below|under)", t):
+        kw = extract_kwh(note)
+        if kw is not None and windows:
+            return "max_grid_window", {"windows": windows, "value": kw, "value_unit": "kwh"}
 
     # --- minimum_battery_reserve ---
-    if re.search(r"reserve|keep at least|keep\b.*battery|stored|remain\b.*battery|emergency|backup|requires? at least|at least\b.*\bkwh\b", t) and ("battery" in t or "reserve" in t or "emergency" in t or "backup" in t):
-        rv = extract_reserve_kwh(note, capacity)
-        if rv is not None and hours:
-            rv = max(0.0, min(float(capacity), rv))
-            return "minimum_battery_reserve", {"hours": hours, "minimum_energy_kwh": rv}
+    reserve_ctx = re.search(r"reserve|keep|retain|hold|maintain|at least|remain|minimum|never drop|drop (under|below)|below|under|cushion|buffer|backup|emergency|requires?", t)
+    batt_ctx = any(k in t for k in ["batter", "stor", "capacity", "reserve", "emergency", "backup"])
+    if reserve_ctx and batt_ctx:
+        kw = extract_kwh(note)
+        if kw is not None and windows:
+            return "minimum_battery_reserve", {"windows": windows, "value": kw, "value_unit": "kwh"}
+        pct = extract_percent(note)
+        if pct is not None and windows and ("capacity" in t or "batter" in t):
+            return "minimum_battery_reserve", {"windows": windows, "value": pct, "value_unit": "percent_remaining"}
 
-    # --- no_discharge_window (check before charge: 'discharge' contains 'charge' substring risk avoided by explicit word) ---
-    if has_discharge_word and (neg or re.search(r"must not|do not|don't|no .*discharg|without.*discharg|disabled|unavailable|prohibit|protection|testing|relay", t)):
-        if hours:
-            return "no_discharge_window", {"hours": hours}
+    # --- no_discharge_window ---
+    dis_block = ("discharg" in t) or (
+        re.search(r"suppl|deliver|provid|export|feed\b|output.{0,12}block", t)
+        and (any(k in t for k in ["batter", "stor", "campus", "system"]) or "not" in t or "n't" in t))
+    if dis_block and re.search(r"not |n't|no |never|block|must not|cannot|can't|prohibit|forbidden|unavailable|disabled|testing|relay|protection|check|safety", t):
+        if windows:
+            return "no_discharge_window", {"windows": windows, "value": 0, "value_unit": "none"}
 
     # --- no_charge_window ---
-    if has_charge_word and not has_discharge_word and (neg or re.search(r"unavailable|disabled|isolated|outage|maintenance|inspect|must not|do not|don't|no charg", t)):
-        if hours:
-            return "no_charge_window", {"hours": hours}
-    # charger isolated phrasing without explicit 'not'
-    if re.search(r"charger.*(isolated|maintenance|inspect|outage|unavailable|disabled)", t) and hours:
-        return "no_charge_window", {"hours": hours}
-    if re.search(r"charging.*(unavailable|disabled|isolated|outage)", t) and hours:
-        return "no_charge_window", {"hours": hours}
+    ch_block = ("charg" in t) or re.search(r"accept.{0,12}energy|lock out.{0,12}charger|charger.{0,12}(lock|isolated|offline)", t)
+    if ch_block and "discharg" not in t and re.search(
+            r"not |n't|no |never|prohibit|forbidden|must not|cannot|can't|unavailable|disabled|isolated|offline|outage|maintenance|inspect|lock|replace|update|test|block", t):
+        if windows:
+            return "no_charge_window", {"windows": windows, "value": 0, "value_unit": "none"}
 
     # --- solar_reduction ---
-    if has_solar and (re.search(r"reduc|drop|%|percent|fraction|half|quarter|third|fifth|half|clean|wash|inspect|maintenance|inverter|cloud|shade|cover|output|forecast|usable", t)):
-        f = extract_solar_factor(note)
-        if f is not None and hours:
-            return "solar_reduction", {"hours": hours, "factor": f}
-        if hours and ("clean" in t or "wash" in t or "maintenance" in t):
-            # last-resort factor if wording lacks explicit number
-            return "solar_reduction", {"hours": hours, "factor": 0.5}
+    if has_solar and re.search(r"reduc|drop|cut|shade|cloud|dust|haze|halv|half|nothing|%|percent|fraction|quarter|third|fifth|clean|wash|inspect|maintenance|inverter|cover|output|forecast|usable|offline|yield|produce|shading|monsoon|scaffold", t):
+        pct = extract_percent(note)
+        if pct is not None and windows:
+            return "solar_reduction", {"windows": windows, "value": pct, "value_unit": _solar_unit(t)}
 
-    # --- fallback heuristics when hours missing but intent clear ---
-    # (guardrail requires hours; without hours we cannot emit applicable directive)
-    if is_distractor(note):
-        return "no_op", None
-    # If energy keywords exist but we failed to parse, still return no_op shape
-    # and let the LLM path (when available) override. Optimizer stays feasible.
-    # To avoid silent wrong no_op, caller prefers LLM result when present.
     return "no_op", None
