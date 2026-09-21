@@ -55,6 +55,8 @@ def parse_windows(note: str):
     cands = []
     for m in pat.finditer(t):
         tok, raw_min, mk = m.group(1), m.group(2), (m.group(3) or "").replace(".", "")
+        if tok in ("noon", "midnight") and m.start() > 0 and (t[m.start() - 1].isalnum() or t[m.start() - 1] == "_"):
+            continue  # e.g. "afternoon" is not noon
         if tok == "noon":
             cands.append({"h": 12, "mer": "pm", "colon": False, "pos": m.start()})
             continue
@@ -64,13 +66,15 @@ def parse_windows(note: str):
         raw_h, raw_min = int(tok), int(raw_min) if raw_min else 0
         if raw_min >= 60 or raw_h > 23:
             continue
+        if raw_h == 0 and not mk and ":" not in m.group(0):
+            continue  # ghost from "zero"->0; real midnight comes via the word
         end = m.end()
         nxt = t[end:end + 8]
         if "%" in nxt[:4] or "kwh" in nxt[:6] or re.match(r"\s*kw\b", nxt) or "percent" in nxt[:10]:
             continue  # a quantity, not a time
         if re.match(r"\s*-\s*(fifth|quarter|third|half|fourth)", t[end:end + 12], re.I):
             continue  # "one-fifth" fraction, not a time
-        if re.match(r"\s+(quarters?|thirds?|fifths?|hal(f|ves)|fourths?)\b", t[end:end + 12], re.I):
+        if re.match(r"\s*(quarters?|thirds?|fifths?|hal(f|ves)|fourths?)\b", t[end:end + 12], re.I):
             continue  # "three quarters" fraction, not a time
         has_colon = ":" in m.group(0)
         if not mk and not has_colon:
@@ -155,9 +159,9 @@ def _solar_unit(t: str) -> str:
     # "reduced by X" / "cutting ... by X" / "fall by X" / "X% reduction" = CUT.
     # "drop to X" / "reduce to X" / "of forecast" = what is LEFT.
     if re.search(r"\bby\b\s*(\d|three|quarter|half|third|fifth)", t) and re.search(
-            r"reduc|cut|drop|lower|decrease|fall|los|shav", t):
+            r"reduc|cut|drop|lower|decrease|fall|los|shav|curtail|slash|trim", t):
         return "percent_reduction"
-    if re.search(r"\breduction\b", t):
+    if re.search(r"\breduction\b|\bcurtail\w*", t):
         return "percent_reduction"
     return "percent_remaining"
 
@@ -173,24 +177,24 @@ def rule_parse_note(note: str):
     t = note.lower()
     windows = parse_windows(note)
 
-    has_solar = any(k in t for k in ["solar", "pv", "photovoltaic", "panel", "rooftop", "inverter"])
+    has_solar = any(k in t for k in ["solar", "pv", "photovoltaic", "panel", "rooftop", "inverter", "sun", "array"])
     has_grid = any(k in t for k in ["grid", "feeder", "transformer", "substation", "import",
-                                    "intake", "purchase", "utility", "demand response"])
+                                    "intake", "purchase", "utility", "demand response", "mains"])
     # --- max_grid_window ---
-    if has_grid and re.search(r"not exceed|must stay|stay at|or below|at or below|capp?ed|\bcap\b|limit|maximum|at most|no more than|keep.{0,20}(below|under)", t):
+    if has_grid and re.search(r"not exceed|must stay|stay at|stay under|or below|at or below|capp?ed|\bcap\b|ceiling|limit|maximum|at most|no more than|keep.{0,20}(below|under)", t):
         kw = extract_kwh(note)
         if kw is not None and windows:
             return "max_grid_window", {"windows": windows, "value": kw, "value_unit": "kwh"}
 
     # --- minimum_battery_reserve ---
-    reserve_ctx = re.search(r"reserve|keep|retain|hold|maintain|at least|remain|minimum|never drop|drop (under|below)|below|under|cushion|buffer|backup|emergency|requires?", t)
-    batt_ctx = any(k in t for k in ["batter", "stor", "capacity", "reserve", "emergency", "backup"])
+    reserve_ctx = re.search(r"reserve|keep|retain|hold|maintain|at least|remain|minimum|never drop|drop (under|below)|fall (under|below)|below|under|cushion|buffer|backup|emergency|requires?", t)
+    batt_ctx = any(k in t for k in ["batter", "stor", "capacity", "reserve", "emergency", "backup", "cell", "pack"])
     if reserve_ctx and batt_ctx:
         kw = extract_kwh(note)
         if kw is not None and windows:
             return "minimum_battery_reserve", {"windows": windows, "value": kw, "value_unit": "kwh"}
         pct = extract_percent(note)
-        if pct is not None and windows and ("capacity" in t or "batter" in t):
+        if pct is not None and windows and any(k in t for k in ["capacity", "batter", "cell", "pack", "stor"]):
             return "minimum_battery_reserve", {"windows": windows, "value": pct, "value_unit": "percent_remaining"}
 
     # --- no_discharge_window ---
@@ -204,12 +208,12 @@ def rule_parse_note(note: str):
     # --- no_charge_window ---
     ch_block = ("charg" in t) or re.search(r"accept.{0,12}energy|lock out.{0,12}charger|charger.{0,12}(lock|isolated|offline)", t)
     if ch_block and "discharg" not in t and re.search(
-            r"not |n't|no |never|prohibit|forbidden|must not|cannot|can't|unavailable|disabled|isolated|offline|outage|maintenance|inspect|lock|replace|update|test|block", t):
+            r"not |n't|no |never|prohibit|forbid|must not|cannot|can't|unavailable|disabled|isolated|offline|outage|maintenance|inspect|lock|replace|update|test|block|servic|dead|dark", t):
         if windows:
             return "no_charge_window", {"windows": windows, "value": 0, "value_unit": "none"}
 
     # --- solar_reduction ---
-    if has_solar and re.search(r"reduc|drop|cut|shade|cloud|dust|haze|halv|half|nothing|%|percent|fraction|quarter|third|fifth|clean|wash|inspect|maintenance|inverter|cover|output|forecast|usable|offline|yield|produce|shading|monsoon|scaffold", t):
+    if has_solar and re.search(r"reduc|drop|cut|shade|cloud|dust|haze|halv|half|nothing|zero|%|percent|fraction|quarter|third|fifth|clean|wash|inspect|maintenance|inverter|cover|output|forecast|usable|offline|yield|produce|shading|monsoon|scaffold|curtail|eclipse|fog|storm|trim|dim|blot|sink|slash", t):
         pct = extract_percent(note)
         if pct is not None and windows:
             return "solar_reduction", {"windows": windows, "value": pct, "value_unit": _solar_unit(t)}
