@@ -45,8 +45,21 @@ LLM diye operator note pore, guardrail diye check kore, LP (scipy/HiGHS) diye
 
 ## 4. Notun chat-ke dewar starter prompt (copy-paste)
 
-"Ei repo-r PLAYBOOK.md §2 (postmortem) ar §3 (checklist) poro. `git log --oneline -5`
-dekhe current state bojho. Kono code change-er age checklist-er relevant item
-diye verify koro, change-er poreo abar verify koro. Ekta file change kore ekta
-commit+push (message choto, Banglish-e na — English-e). Secret (key/token) kokhono
-chat-e, code-e ba git-e diba na."
+"Ei repo-r PLAYBOOK.md §2 (postmortem), §3 (checklist) ar §5 (hardening) poro.
+`git log --oneline -5` dekhe current state bojho. Kono code change-er age
+checklist-er relevant item diye verify koro, change-er poreo abar verify koro
+(`python test_samples.py` = 10/10, `python eval_paraphrases.py` = 32/32 thakte
+hobe). Ekta file change kore ekta commit+push (message English-e, choto).
+Secret (key/token) kokhono chat-e, code-e ba git-e diba na."
+
+## 5. Post-event hardening (done, commits after `7fb8f0a`)
+
+- `app/units.py` (new): LLM + rule parser emit windows+unit only; conversion
+  centralized — LLM arithmetic mistakes impossible by construction.
+- `app/rule_parser.py`: 11 miss fixed → own 32-set **32/32**, oder 31-set **31/31**.
+- `app/validator.py` (new) + `app/main.py`: every response replay-checked
+  before return; failing plan falls back to base-valid schedule (never 500).
+- `tests/paraphrases.json` (32 own notes) + `eval_paraphrases.py`
+  (`--llm` flag tests the live LLM path too).
+- Gemini strict `response_json_schema` + 8s timeout + browser UA + 5xx retry.
+- Verify anytime: `python test_samples.py` (10/10) + `python eval_paraphrases.py` (32/32).
